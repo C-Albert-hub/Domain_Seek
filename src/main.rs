@@ -4,12 +4,12 @@ use rust_xlsxwriter::Workbook;
 use colored::*;
 use clap::Parser;
 use tokio::sync::Semaphore;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{stream::{FuturesUnordered, StreamExt}, future::BoxFuture, FutureExt};
 use reqwest::{Client, Proxy};
 use serde::Deserialize;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "批量域名反查工具（HTTP DNS API + 代理）")]
+#[command(author, version, about = "批量域名反查工具（HTTP DNS API + 代理 + CNAME递归）")]
 struct Args {
     #[arg(short, long, default_value = "domains.csv", help = "输入 CSV 文件路径 (第一列为域名)")]
     input: PathBuf,
@@ -19,17 +19,48 @@ struct Args {
     proxy: Option<String>,
     #[arg(short='c', long="concurrency", default_value_t = 50, help="并发查询数量，默认 50")]
     concurrency: usize,
+    #[arg(short='d', long="max-depth", default_value_t = 5, help="CNAME递归最大深度，默认 5")]
+    max_depth: usize,
 }
 
 #[derive(Deserialize)]
 struct GoogleDnsAnswer {
     data: Option<String>,
+    #[serde(rename = "type")]
+    type_: u32, // 1=A, 5=CNAME
 }
 
 #[derive(Deserialize)]
 struct GoogleDnsResponse {
     #[serde(rename = "Answer")]
     answer: Option<Vec<GoogleDnsAnswer>>,
+}
+
+// 递归解析函数，返回 BoxFuture，解决 async fn 递归报错
+fn resolve_ip(client: Arc<Client>, domain: String, depth: usize, max_depth: usize) -> BoxFuture<'static, Option<String>> {
+    async move {
+        if depth > max_depth { return None; }
+
+        let url = format!("https://dns.google/resolve?name={}&type=A", domain);
+        let resp = client.get(&url).send().await.ok()?;
+        let json: GoogleDnsResponse = resp.json().await.ok()?;
+
+        if let Some(ans) = json.answer {
+            for record in ans {
+                match record.type_ {
+                    1 => return record.data, // A记录直接返回IP
+                    5 => {
+                        if let Some(cname) = record.data {
+                            // 递归CNAME
+                            return resolve_ip(client.clone(), cname, depth + 1, max_depth).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }.boxed()
 }
 
 #[tokio::main]
@@ -40,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("输入文件: {}", args.input.to_string_lossy().yellow());
     println!("输出文件: {}", args.output.to_string_lossy().cyan());
     println!("并发查询数量: {}", args.concurrency.to_string().magenta());
+    println!("CNAME递归最大深度: {}", args.max_depth.to_string().magenta());
     if let Some(proxy) = &args.proxy {
         println!("使用代理: {}", proxy.magenta());
     }
@@ -88,17 +120,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let d = domain.clone();
         let client = client.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let max_depth = args.max_depth;
         tasks.push(tokio::spawn(async move {
-            let url = format!("https://dns.google/resolve?name={}&type=A", d);
-            let res = match client.get(&url).send().await {
-                Ok(resp) => match resp.json::<GoogleDnsResponse>().await {
-                    Ok(json) => json.answer.and_then(|ans| ans.get(0).and_then(|a| a.data.clone())),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            };
+            let ip = resolve_ip(client.clone(), d.clone(), 0, max_depth).await;
+
+            // 实时打印
+            match &ip {
+                Some(ip_str) => println!("{} -> {}", d.blue(), ip_str.green()),
+                None => println!("{} -> {}", d.blue(), "查询失败".red()),
+            }
+
             drop(permit);
-            (d, res)
+            (d, ip)
         }));
     }
 
@@ -108,14 +141,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         results_map.insert(domain, ip);
     }
 
-    // 按原始顺序输出和写 Excel
+    // 按原始顺序写 Excel
     let mut row = 1;
     for domain in domains {
         let ip_opt = results_map.get(&domain).cloned().unwrap_or(None);
-        match &ip_opt {
-            Some(ip_str) => println!("{} -> {}", domain.blue(), ip_str.green()),
-            None => println!("{} -> {}", domain.blue(), "查询失败".red()),
-        }
         worksheet.write_string(row, 0, domain)?;
         worksheet.write_string(row, 1, &ip_opt.unwrap_or("查询失败".to_string()))?;
         row += 1;
